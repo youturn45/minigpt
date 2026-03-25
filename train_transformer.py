@@ -6,7 +6,12 @@ import torch
 import sentencepiece as spm
 from model import DecoderModel, get_batch, estimate_loss
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    DEVICE = torch.device('cuda')
+elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+    DEVICE = torch.device('mps')
+else:
+    DEVICE = torch.device('cpu')
 print(f'Using device: {DEVICE}')
 
 # ── Hyperparameters ──────────────────────────────────────────
