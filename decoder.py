@@ -7,99 +7,105 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.1
 #   kernelspec:
-#     display_name: .venv_2
+#     display_name: Python 3
 #     language: python
 #     name: python3
 # ---
 
 # %% [markdown]
-# # MiniGPT — Decoder-Only Transformer from Scratch
+# # MiniGPT — Decoder-Only Transformer Demo
 #
-# This notebook walks through training a small GPT-style language model on a
-# plain text file. The model learns to predict the next token and, once trained,
-# can generate new text in the style of the training data.
+# Loads the artefacts produced by `train.py` and walks through every stage of the
+# transformer pipeline step by step, using **trained weights** throughout so that
+# all similarity scores and attention patterns reflect real learned behaviour.
 #
-# All model classes live in `model.py`. This notebook focuses on:
-# - The data pipeline
-# - A step-by-step visual walkthrough of the transformer
-# - The training loop
-# - Inference / text generation
-
-# %% [markdown]
-# ## 1. Imports
+# **Run `train.py` first** to generate:
+# - `tokenizer/bpe.model` — BPE tokenizer
+# - `checkpoints/transformer_step*.pt` — trained model weights (latest checkpoint loaded automatically)
+#
+# **Pipeline overview:**
+# ```
+# raw text
+#   │
+#   ▼
+# [Step 1]  Tokenisation      — BPE splits text into subword token IDs
+#   │
+#   ▼
+# [Step 2]  Token Embedding   — each ID → dense vector (embed_dim)
+#   │
+#   ▼
+# [Step 3]  Positional Enc.   — add position signal so the model knows token order
+#   │
+#   ▼
+# [Step 4]  Attention Head    — one head: Q·K scores select which tokens to attend to
+#   │
+#   ▼
+# [Step 5]  Multi-Head Attn   — N heads run in parallel, outputs concatenated
+#   │
+#   ▼
+# [Step 6]  Feed-Forward      — per-token MLP processes what attention gathered
+#   │
+#   ▼
+# [Step 7]  Full Block        — attention + FFN with LayerNorm and residuals
+#   │
+#   ▼
+# [Step 8]  Stacked Blocks    — N_LAYER blocks refine representations layer by layer
+#   │
+#   ▼
+# [Step 9]  Output Head       — LayerNorm → linear → softmax → P(next token)
+#   │
+#   ▼
+# [Step 10] Inference         — autoregressively sample new tokens
+# ```
 
 # %%
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath("__file__")), "model"))
+import glob
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath('__file__')), 'model'))
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import sentencepiece as spm
-from model import (
-    PositionalEncoding,
-    Head,
-    MultiHeadAttention,
-    FeedForward,
-    Block,
-    DecoderModel,
-    get_batch,
-    estimate_loss,
-)
+from model import DecoderModel, get_batch
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {DEVICE}')
 
 # %% [markdown]
-# ## 2. Tokenizer
-#
-# We use SentencePiece BPE to convert raw text into integer token IDs.
-# The tokenizer is trained once on `input.txt` and saved to `mymodel.model`.
-# Re-run the training cell only if you change the input file or vocabulary size.
-#
-# **Hyperparameter:**
-# | Name | Value | Description |
-# |---|---|---|
-# | `VOCAB_SIZE` | 10000 | number of unique BPE tokens the tokenizer can produce |
+# ## Load Artefacts
 
 # %%
-VOCAB_SIZE = 20000   # number of unique BPE tokens
-
-# %%
-# Train tokenizer (only needs to run once)
-spm.SentencePieceTrainer.train(
-    input="data/三国演义.txt",
-    model_prefix="tokenizer/mymodel",
-    vocab_size=VOCAB_SIZE,
-    model_type="bpe",
-)
-
-# %%
-# Load the trained tokenizer
+# ── Tokenizer ────────────────────────────────────────────────
 sp = spm.SentencePieceProcessor()
-sp.load("tokenizer/mymodel.model")
+sp.load('tokenizer/bpe.model')
+print(f'Tokenizer loaded  — vocab size: {sp.get_piece_size():,}')
 
-print(f"Vocabulary size : {sp.get_piece_size()}")
-print(f"Example encoding: {sp.encode('张飞何许人也', out_type=str)}")
+# ── Model ─────────────────────────────────────────────────────
+latest = sorted(glob.glob('checkpoints/transformer_step*.pt'))[-1]
+print(f'Loading checkpoint: {latest}')
+checkpoint = torch.load(latest, map_location=DEVICE)
+hp = checkpoint['hyperparams']
 
-# %% [markdown]
-# ## 3. Data Loading
-#
-# The full text is encoded into a flat tensor of token IDs, then split
-# 90% for training and 10% for validation.
-#
-# **Hyperparameters:**
-# | Name | Value | Description |
-# |---|---|---|
-# | `BATCH_SIZE` | 64 | number of sequences processed in parallel per training step |
-# | `BLOCK_SIZE` | 60 | maximum context length in tokens (how far back the model can look) |
+model = DecoderModel(**hp).to(DEVICE)
+model.load_state_dict(checkpoint['state_dict'])
+model.eval()
+
+print(f'Transformer loaded — {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters')
+print(f'Hyperparameters    : {hp}')
+
+# ── Unpack hyperparameters for use in the demos below ─────────
+VOCAB_SIZE = hp['vocab_size']
+EMBED_DIM  = hp['embed_dim']
+BLOCK_SIZE = hp['block_size']
+N_HEAD     = hp['n_head']
+N_LAYER    = hp['n_layer']
+DROPOUT    = hp['dropout']
+HEAD_SIZE  = EMBED_DIM // N_HEAD
 
 # %%
-BATCH_SIZE = 64   # sequences per training step
-BLOCK_SIZE = 60   # context window length (tokens)
-
-# %%
-with open("data/三国演义.txt", "r") as f:
+# Load and tokenize the text so we can sample demo batches
+with open('data/三国演义.txt', 'r') as f:
     text = f.read()
 
 data = torch.tensor(sp.encode(text), dtype=torch.long)
@@ -107,394 +113,349 @@ n = int(0.9 * len(data))
 train_data = data[:n]
 val_data   = data[n:]
 
-print(f"Total tokens : {len(data):,}")
-print(f"Train tokens : {len(train_data):,}")
-print(f"Val tokens   : {len(val_data):,}")
+BATCH_SIZE = 64
+
+# Sample one batch — used throughout the walkthrough below
+x_ids, _ = get_batch(train_data, val_data, 'train', BLOCK_SIZE, BATCH_SIZE, DEVICE)
+
+sample_ids    = x_ids[0].tolist()
+sample_pieces = [sp.id_to_piece(i) for i in sample_ids]
+sample_text   = sp.decode(sample_ids)
+
+print('=== Sample sequence (first item in the batch) ===\n')
+print(f'Raw text     : {sample_text!r}\n')
+print(f'Subword pieces ({len(sample_pieces)}) : {sample_pieces}\n')
+print(f'Token IDs    : {sample_ids}\n')
+print(f'Batch shape  : {list(x_ids.shape)}  (batch_size={BATCH_SIZE}, seq_len={BLOCK_SIZE})')
 
 # %% [markdown]
-# ## 4. Transformer Walkthrough — Step by Step
+# ---
+# ## Step 1 — Tokenisation
 #
-# Rather than jumping straight to the full model, this section manually passes
-# a sample batch through each component so you can see exactly what shape the
-# data is at every stage.
+# Before the model sees any text it must convert raw characters into integers.
+# BPE does this by learning common subword *pieces* from the training corpus:
+# frequent sequences get their own token, rare ones are broken into smaller pieces.
 #
-# **Notation:** `(B, T, C)` means *batch × sequence length × channels (embedding dim)*
-#
-# **Hyperparameters:**
-# | Name | Value | Description |
-# |---|---|---|
-# | `EMBED_DIM` | 128 | size of each token's vector representation |
-# | `N_HEAD` | 4 | number of parallel attention heads per transformer block |
-# | `N_LAYER` | 4 | number of transformer blocks stacked on top of each other |
-# | `DROPOUT` | 0.2 | fraction of activations randomly zeroed during training to prevent overfitting |
+# This lets the model handle any text with a fixed, compact vocabulary — common
+# words like `刘备` may become a single token while rare names are split into
+# smaller pieces the model has seen before.
 
 # %%
-EMBED_DIM = 128   # token embedding / hidden size
-N_HEAD    = 4     # attention heads per block
-N_LAYER   = 4     # number of stacked transformer blocks
-DROPOUT   = 0.2   # dropout rate
+examples = [
+    '刘备仁义厚道',
+    '曹操奸雄也',
+    '诸葛亮足智多谋',
+    '张飞勇猛善战',
+]
 
-# %%
-# Grab a small sample batch to use throughout the walkthrough
-x_ids, _ = get_batch(train_data, val_data, "train", BLOCK_SIZE, BATCH_SIZE, DEVICE)
-
-# Show the raw text behind the first sequence in the batch
-sample_ids   = x_ids[0].tolist()
-sample_text  = sp.decode(sample_ids)
-sample_pieces = [sp.id_to_piece(id) for id in sample_ids]
-
-print("=== Sample sequence (first item in the batch) ===\n")
-print(f"Raw text    : {sample_text!r}\n")
-print(f"Subword pieces ({len(sample_pieces)}) : {sample_pieces}\n")
-print(f"Token IDs   : {sample_ids}\n")
-print(f"Batch shape : {list(x_ids.shape)}  (batch_size={BATCH_SIZE}, seq_len={BLOCK_SIZE})")
+print(f'{'Text':<16}  {'Pieces':<45}  IDs')
+print('-' * 80)
+for s in examples:
+    pieces = sp.encode(s, out_type=str)
+    ids    = sp.encode(s)
+    print(f'{s:<16}  {str(pieces):<45}  {ids}')
 
 # %% [markdown]
-# ### Step 1 — Token Embedding
+# ---
+# ## Step 2 — Token Embedding
 #
-# Each integer token ID is looked up in a learned embedding table and replaced
-# with a dense vector of size `EMBED_DIM`. The model will learn what these
-# vectors mean during training.
+# Each integer token ID is looked up in a learned table (`vocab_size × embed_dim`)
+# and replaced with a dense vector. The model adjusts these vectors during training
+# so that tokens appearing in similar contexts end up close together in the
+# `embed_dim`-dimensional space.
 #
-# To make this concrete, we pick a few characters and show which tokens in the
-# vocabulary are most and least similar to them using **cosine similarity**.
+# We measure closeness with **cosine similarity**: 1.0 means identical direction,
+# 0.0 means orthogonal, -1.0 means opposite.
 #
-# > Note: the embedding is randomly initialised here — similarities will be
-# > meaningful only after training. This just shows the mechanism.
+# Because these are *trained* weights, tokens that appear in similar narrative
+# contexts in 三国演义 should cluster together — without anyone labelling them.
 
 # %%
-embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM).to(DEVICE)
+with torch.no_grad():
+    tok_emb = model.embedding(x_ids)   # (B, T, embed_dim)
 
-tok_emb = embedding(x_ids)
+print(f'Input  →  token IDs  : {list(x_ids.shape)}')
+print(f'Output →  embeddings : {list(tok_emb.shape)}  — each ID is now a {EMBED_DIM}-dim vector')
 
-print(f"Input  →  token IDs  : {list(x_ids.shape)}")
-print(f"Output →  embeddings : {list(tok_emb.shape)}  — each ID is now a {EMBED_DIM}-dimensional vector\n")
 
 # %%
-import torch.nn.functional as F
-
 def show_similar_tokens(token: str, sp, embedding, top_n: int = 5):
     """Print the top_n most and least similar tokens to `token` by cosine similarity."""
     token_id = sp.piece_to_id(token)
     if token_id == 0:
-        print(f"'{token}' not found in vocabulary.\n")
+        print(f"  '{token}' not found in vocabulary.\n")
         return
 
-    all_weights = embedding.weight  # (vocab_size, embed_dim)
-    token_vec   = all_weights[token_id].unsqueeze(0)  # (1, embed_dim)
+    all_weights = embedding.weight.detach()   # (vocab_size, embed_dim)
+    token_vec   = all_weights[token_id].unsqueeze(0)
 
-    sims = F.cosine_similarity(token_vec, all_weights)  # (vocab_size,)
-
-    # exclude the token itself
-    sims[token_id] = float("nan")
+    sims = F.cosine_similarity(token_vec, all_weights)
+    sims[token_id] = float('nan')
     valid = [(i, sims[i].item()) for i in range(len(sims)) if not sims[i].isnan()]
     valid.sort(key=lambda x: x[1], reverse=True)
 
-    top  = [(sp.id_to_piece(i), f"{s:.2f}") for i, s in valid[:top_n]]
-    bot  = [(sp.id_to_piece(i), f"{s:.2f}") for i, s in valid[-top_n:]]
+    top = [(sp.id_to_piece(i), f'{s:.2f}') for i, s in valid[:top_n]]
+    bot = [(sp.id_to_piece(i), f'{s:.2f}') for i, s in valid[-top_n:]]
 
     print(f"  '{token}'")
-    print(f"    top {top_n} similar  : {top}")
-    print(f"    top {top_n} dissimilar: {bot}\n")
+    print(f'    most similar    : {top}')
+    print(f'    least similar   : {bot}\n')
 
-probe_tokens = ["刘", "曹", "战", "兵", "城"]
-print("=== Embedding similarity (randomly initialised — run again after training) ===\n")
-for t in probe_tokens:
-    show_similar_tokens(t, sp, embedding, top_n=5)
 
-# %%
-
-# %% [markdown]
-# ### Step 2 — Positional Encoding
-#
-# The transformer processes all tokens in a sequence **simultaneously** — unlike
-# reading left to right, it sees everything at once. That means by default it
-# has no idea what order the tokens are in.
-#
-# These two sentences would look completely identical to it:
-#
-# ```
-# 刘备 打 曹操   →  just a bag of 3 tokens
-# 曹操 打 刘备   →  same 3 tokens, totally different meaning
-# ```
-#
-# Without order, the model can't tell who hit who.
-#
-# ---
-#
-# **The solution: add a position signal to every embedding**
-#
-# Before the tokens go into the transformer, we add a unique pattern to each one
-# based on its position. Token at position 0 gets one pattern added, position 1
-# gets a slightly different pattern, and so on.
-#
-# ```
-# position 0:  embedding + [0.0,  1.0,  0.0,  1.0, ...]
-# position 1:  embedding + [0.84, 0.54, 0.01, 0.99, ...]
-# position 2:  embedding + [0.91, -0.41, 0.02, 0.99, ...]
-# ```
-#
-# The embedding still carries **what** the token is.
-# The positional pattern carries **where** it is.
-# They are simply added together — shape goes in unchanged, position baked in.
-
-# %%
-pos_enc = PositionalEncoding(d_model=EMBED_DIM, max_len=BLOCK_SIZE).to(DEVICE)
-
-x = pos_enc(tok_emb)
-
-# Show the actual positional vectors for the first few positions
-pe_matrix = pos_enc.pe.squeeze(0)  # (block_size, embed_dim)
-print("Positional encoding vectors for first 3 positions (first 8 dimensions shown):\n")
-for pos in range(3):
-    vec = pe_matrix[pos, :8].tolist()
-    print(f"  position {pos}: [{', '.join(f'{v:.2f}' for v in vec)}, ...]")
-
-print(f"\nInput  →  embeddings           : {list(tok_emb.shape)}")
-print(f"Output →  embeddings + position : {list(x.shape)}  (shape unchanged, position baked in)")
-
-# %% [markdown]
-# **How similar are nearby positions?**
-#
-# Because the patterns use sine/cosine waves that change gradually, nearby
-# positions have similar patterns and distant positions have very different ones.
-# We can verify this with cosine similarity between position vectors:
-
-# %%
-def show_position_similarity(pos_enc, anchor: int, compare_positions: list):
-    """Show cosine similarity between an anchor position and a list of other positions."""
-    pe = pos_enc.pe.squeeze(0)  # (block_size, embed_dim)
-    anchor_vec = pe[anchor].unsqueeze(0)
-    print(f"Cosine similarity to position {anchor}:\n")
-    for p in compare_positions:
-        sim = F.cosine_similarity(anchor_vec, pe[p].unsqueeze(0)).item()
-        bar = "█" * int(abs(sim) * 20)
-        print(f"  vs position {p:>2}: {sim:+.3f}  {bar}")
-
-show_position_similarity(pos_enc, anchor=0, compare_positions=[1, 2, 5, 10, 20, 40, 59])
-
-# %% [markdown]
-# ### Step 3 — Single Attention Head
-#
-# One attention head projects the input into Queries, Keys, and Values, then
-# computes how much each token should attend to every other (past) token.
-# The output per head has size `EMBED_DIM // N_HEAD`.
-
-# %%
-HEAD_SIZE = EMBED_DIM // N_HEAD
-head = Head(EMBED_DIM, HEAD_SIZE, BLOCK_SIZE, DROPOUT).to(DEVICE)
-
-head_out = head(x)
-
-print(f"Input  →  embeddings  : {list(x.shape)}")
-print(f"Output →  head output : {list(head_out.shape)}  (batch, seq_len, head_size)")
-print(f"\nNote: head_size = embed_dim / n_heads = {EMBED_DIM} / {N_HEAD} = {HEAD_SIZE}")
-
-# %% [markdown]
-# ### Step 4 — Multi-Head Attention
-#
-# We run `N_HEAD` attention heads in parallel. Each head can focus on different
-# patterns (e.g. syntax, semantics). Their outputs are concatenated and projected
-# back to `EMBED_DIM` — the same size as the input.
-
-# %%
-mha = MultiHeadAttention(N_HEAD, HEAD_SIZE, EMBED_DIM, BLOCK_SIZE, DROPOUT).to(DEVICE)
-
-mha_out = mha(x)
-
-print(f"Input  →  embeddings          : {list(x.shape)}")
-print(f"Output →  multi-head attention: {list(mha_out.shape)}  (batch, seq_len, embed_dim)")
-print(f"\nNote: {N_HEAD} heads × head_size {HEAD_SIZE} = {N_HEAD * HEAD_SIZE}, projected back to {EMBED_DIM}")
-
-# %% [markdown]
-# ### Step 5 — Feed-Forward Network
-#
-# After attention, each token independently passes through a small two-layer MLP.
-# It expands to `4 × EMBED_DIM` internally, then projects back. This gives the
-# model capacity to process what it gathered from attention.
-
-# %%
-ffn = FeedForward(EMBED_DIM, DROPOUT).to(DEVICE)
-
-ffn_out = ffn(x)
-
-print(f"Input  →  embeddings  : {list(x.shape)}")
-print(f"Hidden →  expanded    : (batch, seq_len, {4 * EMBED_DIM})  [4× internal expansion]")
-print(f"Output →  ffn output  : {list(ffn_out.shape)}  (back to embed_dim)")
-
-# %% [markdown]
-# ### Step 6 — One Full Transformer Block
-#
-# A `Block` combines steps 4 and 5 with **residual connections** and **LayerNorm**.
-# Residuals let gradients flow during training; LayerNorm stabilises activations.
-#
-# ```
-# x  →  LayerNorm  →  MultiHeadAttention  →  + x  →  LayerNorm  →  FeedForward  →  + x
-# ```
-
-# %%
-block = Block(EMBED_DIM, N_HEAD, BLOCK_SIZE, DROPOUT).to(DEVICE)
-
-block_out = block(x)
-
-print(f"Input  →  embeddings   : {list(x.shape)}")
-print(f"Output →  block output : {list(block_out.shape)}  (shape preserved through the block)")
-
-# %% [markdown]
-# ### Step 7 — Stacked Transformer Blocks (the full transformer)
-#
-# The real power comes from stacking `N_LAYER` blocks. Each block refines the
-# representation. Information can flow and be reinterpreted layer by layer.
-
-# %%
-blocks = nn.Sequential(
-    *[Block(EMBED_DIM, N_HEAD, BLOCK_SIZE, DROPOUT) for _ in range(N_LAYER)]
-).to(DEVICE)
-
-stacked_out = blocks(x)
-
-print(f"Input  →  embeddings      : {list(x.shape)}")
-print(f"Output →  after {N_LAYER} blocks  : {list(stacked_out.shape)}  (shape still preserved)")
-print(f"\nEach of the {N_LAYER} blocks independently refines every token's representation.")
-
-# %% [markdown]
-# ### Step 8 — Output Head: Logits → Probabilities
-#
-# Finally, a `LayerNorm` stabilises the output, then a linear layer projects
-# each token's `EMBED_DIM` vector to `VOCAB_SIZE` scores (logits). Softmax
-# turns these into a probability distribution — one probability per token in
-# the vocabulary.
-
-# %%
-ln_f    = nn.LayerNorm(EMBED_DIM).to(DEVICE)
-lm_head = nn.Linear(EMBED_DIM, VOCAB_SIZE).to(DEVICE)
-
-normed  = ln_f(stacked_out)
-logits  = lm_head(normed)
-probs   = torch.softmax(logits, dim=-1)
-
-print(f"After stacked blocks  : {list(stacked_out.shape)}")
-print(f"After LayerNorm       : {list(normed.shape)}")
-print(f"Logits (raw scores)   : {list(logits.shape)}  (batch, seq_len, vocab_size)")
-print(f"Probabilities         : {list(probs.shape)}   (sums to 1.0 across vocab)")
-print(f"\nFor each of the {BLOCK_SIZE} positions, the model outputs a score for all {VOCAB_SIZE:,} possible next tokens.")
-
-# %% [markdown]
-# ## 5. Full Model
-#
-# All the steps above are packaged inside `DecoderModel`. During training it
-# also computes cross-entropy loss against the target tokens.
-
-# %%
-model = DecoderModel(
-    vocab_size=VOCAB_SIZE,
-    embed_dim=EMBED_DIM,
-    block_size=BLOCK_SIZE,
-    n_head=N_HEAD,
-    n_layer=N_LAYER,
-    dropout=DROPOUT,
-).to(DEVICE)
-
-n_params = sum(p.numel() for p in model.parameters())
-print(f"Model parameters: {n_params / 1e6:.2f}M")
-
-# %% [markdown]
-# ## 6. Training
-#
-# We use the AdamW optimizer and minimise cross-entropy loss between the model's
-# predicted next token and the actual next token in the training data.
-# Loss is printed every `EVAL_INTERVAL` steps on both train and validation sets.
-#
-# **Hyperparameters:**
-# | Name | Value | Description |
-# |---|---|---|
-# | `MAX_ITERS` | 5000 | total number of gradient update steps |
-# | `EVAL_INTERVAL` | 500 | print train/val loss every N steps |
-# | `EVAL_ITERS` | 200 | number of batches averaged to estimate loss |
-# | `LR` | 3e-4 | learning rate for AdamW optimizer |
-
-# %%
-MAX_ITERS     = 5000   # total training steps
-EVAL_INTERVAL = 500    # how often to print loss
-EVAL_ITERS    = 200    # batches averaged for each loss estimate
-LR            = 3e-4   # learning rate
-
-# %%
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-
-for step in range(MAX_ITERS):
-
-    if step % EVAL_INTERVAL == 0 or step == MAX_ITERS - 1:
-        losses = estimate_loss(
-            model, train_data, val_data, BLOCK_SIZE, BATCH_SIZE, EVAL_ITERS, DEVICE
-        )
-        print(f"step {step:>5}: train loss {losses['train']:.4f}  val loss {losses['val']:.4f}")
-
-    xb, yb = get_batch(train_data, val_data, "train", BLOCK_SIZE, BATCH_SIZE, DEVICE)
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-
-# %% [markdown]
-# ## 7. Learned Embeddings — What the Model Now Knows
-#
-# Earlier in Step 1, the cosine similarities were random noise because the
-# embedding was uninitialised. Now that training is complete, the embedding
-# table has been updated thousands of times by backpropagation.
-#
-# Tokens that appear in similar contexts in 三国演义 should now sit close
-# together in the 128-dimensional space — without anyone telling the model
-# what any character or word "means". It learned purely from patterns in text.
-#
-# We reuse the same `show_similar_tokens` function from Step 1 but now pass
-# in `model.embedding` — the trained weights — instead of the random one.
-
-# %%
-print("=== Embedding similarity (TRAINED) ===\n")
+probe_tokens = ['刘', '曹', '战', '兵', '城']
+print('=== Trained embedding similarity ===\n')
+print('Tokens that appear in similar contexts will cluster together.\n')
 for t in probe_tokens:
     show_similar_tokens(t, sp, model.embedding, top_n=5)
 
 # %% [markdown]
-# Compare these results to the random ones from Step 1. Tokens like `刘` should
-# now cluster with characters and words that appear alongside it in the text
-# (e.g. `备`, `玄德`), while its enemies or unrelated concepts should score low
-# or negative.
+# ---
+# ## Step 3 — Positional Encoding
 #
-# This is the core intuition behind embeddings: **meaning emerges from context**.
-
-# %% [markdown]
-# ## 7b. Positional Encoding — Position Similarity (after training)
+# The transformer processes all tokens **simultaneously** — it has no built-in
+# sense of order. Without position information these two sentences look identical:
 #
-# Unlike the embedding table, positional encoding is **fixed** — it is never
-# updated during training. So the similarities between positions are the same
-# before and after training.
+# ```
+# 刘备 打 曹操   →  bag of 3 tokens
+# 曹操 打 刘备   →  same 3 tokens, completely different meaning
+# ```
 #
-# What this demo shows is the *structure* of the encoding: nearby positions
-# are more alike than distant ones, which is what we want the model to feel.
-# Position 1 should "feel close" to position 0, and position 59 should "feel
-# far away".
+# The fix: **add a fixed sine/cosine pattern to each embedding based on its
+# position**. Token at position 0 gets one pattern, position 1 a slightly
+# different one, and so on. The embedding still carries *what* the token is;
+# the pattern carries *where* it sits in the sequence.
+#
+# Positional encoding is **never updated by training** — it is computed once
+# from a formula and stays fixed.
 
 # %%
-print("=== Positional similarity from position 0 ===\n")
-show_position_similarity(pos_enc, anchor=0, compare_positions=[1, 2, 5, 10, 20, 40, 59])
+with torch.no_grad():
+    x = model.position_encoding(tok_emb)   # adds position signal in-place
 
-print("\n=== Positional similarity from position 30 (middle of sequence) ===\n")
-show_position_similarity(pos_enc, anchor=30, compare_positions=[29, 28, 25, 20, 10, 1, 0])
+pe_matrix = model.position_encoding.pe.squeeze(0)   # (block_size, embed_dim)
+print('Positional encoding vectors — first 3 positions, first 8 dimensions:\n')
+for pos in range(3):
+    vec = pe_matrix[pos, :8].tolist()
+    print(f'  position {pos}: [{', '.join(f'{v:.3f}' for v in vec)}, ...]')
 
-# %% [markdown]
-# ## 8. Inference
-#
-# Seed the model with a short prompt and let it generate new tokens one at a
-# time. Each new token is sampled from the predicted probability distribution
-# over the vocabulary, then appended to the context for the next step.
+print(f'\nInput  →  embeddings           : {list(tok_emb.shape)}')
+print(f'Output →  embeddings + position : {list(x.shape)}  (shape unchanged)')
+
 
 # %%
-prompt = "SAM:"
-context = torch.tensor(sp.encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
+def show_position_similarity(pe_module, anchor: int, positions: list):
+    """Show cosine similarity between an anchor position and a list of others."""
+    pe = pe_module.pe.squeeze(0)   # (block_size, embed_dim)
+    anchor_vec = pe[anchor].unsqueeze(0)
+    print(f'Cosine similarity to position {anchor}:\n')
+    for p in positions:
+        sim = F.cosine_similarity(anchor_vec, pe[p].unsqueeze(0)).item()
+        bar = '█' * int(abs(sim) * 20)
+        print(f'  vs position {p:>2}: {sim:+.3f}  {bar}')
 
-print(f"Prompt  : {prompt!r}")
-print(f"Context shape: {list(context.shape)}  →  generating 500 tokens...\n")
 
-generated = model.generate(context, max_new_tokens=500)
-print(sp.decode(generated[0].tolist()))
+print('Nearby positions share a similar pattern; distant positions differ.\n')
+show_position_similarity(model.position_encoding, anchor=0,
+                         positions=[1, 2, 5, 10, 20, 40, 59])
+print()
+show_position_similarity(model.position_encoding, anchor=30,
+                         positions=[29, 28, 25, 20, 10, 1, 0])
+
+# %% [markdown]
+# ---
+# ## Step 4 — Single Attention Head
+#
+# One attention head projects each token into three vectors:
+# - **Query (Q)** — 'what information am I looking for?'
+# - **Key (K)** — 'what information do I offer?'
+# - **Value (V)** — 'what do I send if selected?'
+#
+# The dot product Q·Kᵀ scores how relevant each token is to every other token.
+# A causal mask ensures position *t* can only attend to positions ≤ *t* — the
+# model cannot cheat by looking at future tokens.
+#
+# After softmax the scores become weights that are used to take a weighted
+# average of the Values, producing the head output.
+
+# %%
+# Access the first head of the first block
+head = model.blocks[0].sa.heads[0]
+
+with torch.no_grad():
+    head_out = head(x)
+
+print(f'Input  →  embeddings + position : {list(x.shape)}')
+print(f'Output →  head output           : {list(head_out.shape)}  (batch, seq_len, head_size)')
+print(f'\nhead_size = embed_dim / n_heads = {EMBED_DIM} / {N_HEAD} = {HEAD_SIZE}')
+print(f'\nQ weight shape: {list(head.q.weight.shape)}  (head_size × embed_dim)')
+print(f'K weight shape: {list(head.k.weight.shape)}')
+print(f'V weight shape: {list(head.v.weight.shape)}')
+
+# %% [markdown]
+# ---
+# ## Step 5 — Multi-Head Attention
+#
+# Running a single head limits what the model can attend to at once. Running
+# `N_HEAD` heads **in parallel** lets different heads specialise — one might
+# focus on syntactic relationships, another on semantic ones.
+#
+# The outputs of all heads are concatenated (`N_HEAD × head_size = embed_dim`)
+# and projected back through a linear layer so the shape is unchanged.
+
+# %%
+mha = model.blocks[0].sa
+
+with torch.no_grad():
+    mha_out = mha(x)
+
+print(f'Input  →  embeddings + position : {list(x.shape)}')
+print(f'Output →  multi-head attention  : {list(mha_out.shape)}  (shape preserved)')
+print(f'\n{N_HEAD} heads × head_size {HEAD_SIZE} = {N_HEAD * HEAD_SIZE}, projected back to embed_dim {EMBED_DIM}')
+print(f'\nProjection weight shape: {list(mha.proj.weight.shape)}')
+
+# %% [markdown]
+# ---
+# ## Step 6 — Feed-Forward Network
+#
+# After attention each token has gathered information from its context.
+# A small two-layer MLP then processes *each token independently*:
+# expand to `4 × embed_dim`, apply ReLU, project back.
+#
+# The 4× expansion gives the model room to apply non-linear transformations
+# — effectively letting it decide what to do with what it just read.
+
+# %%
+ffn = model.blocks[0].ffwd
+
+with torch.no_grad():
+    ffn_out = ffn(x)
+
+print(f'Input  →  embeddings  : {list(x.shape)}')
+print(f'Hidden →  expanded    : (batch, seq_len, {4 * EMBED_DIM})  [4× internal expansion]')
+print(f'Output →  ffn output  : {list(ffn_out.shape)}  (projected back to embed_dim)')
+print(f'\nLayer shapes:')
+print(f'  Linear 1: {list(ffn.net[0].weight.shape)}  (4×embed_dim, embed_dim)')
+print(f'  ReLU')
+print(f'  Linear 2: {list(ffn.net[2].weight.shape)}  (embed_dim, 4×embed_dim)')
+
+# %% [markdown]
+# ---
+# ## Step 7 — One Full Transformer Block
+#
+# A `Block` combines multi-head attention and the feed-forward network, each
+# wrapped with **LayerNorm** and a **residual connection**:
+#
+# ```
+# x  →  LayerNorm  →  MultiHeadAttention  →  + x   (residual)
+#    →  LayerNorm  →  FeedForward         →  + x   (residual)
+# ```
+#
+# - **LayerNorm** (pre-norm style) stabilises the activations before each sub-layer.
+# - **Residual connections** let gradients flow directly through the network,
+#   making it possible to stack many layers without the signal vanishing.
+
+# %%
+block = model.blocks[0]
+
+with torch.no_grad():
+    block_out = block(x)
+
+print(f'Input  →  embeddings   : {list(x.shape)}')
+print(f'Output →  block output : {list(block_out.shape)}  (shape preserved through the entire block)')
+
+# Show the residual connection in action: the output is close to the input
+delta = (block_out - x).abs().mean().item()
+print(f'\nMean absolute change from residual: {delta:.4f}')
+print('(small = the block made targeted adjustments rather than replacing the representation)')
+
+# %% [markdown]
+# ---
+# ## Step 8 — Stacked Transformer Blocks
+#
+# The real depth of a transformer comes from stacking `N_LAYER` blocks.
+# Each block can build on the representations produced by the one below it:
+# - Early blocks tend to capture low-level patterns (character n-grams, punctuation)
+# - Later blocks capture higher-level structure (who is doing what to whom)
+#
+# Because residual connections run through every block, the signal and gradients
+# can still travel the full depth without degrading.
+
+# %%
+# Show how the representation evolves layer by layer
+print(f'Tracking representation change through {N_LAYER} blocks:\n')
+current = x
+for i, block in enumerate(model.blocks):
+    with torch.no_grad():
+        out = block(current)
+    delta = (out - current).abs().mean().item()
+    print(f'  Block {i}  input: {list(current.shape)}  →  output: {list(out.shape)}  '
+          f'  mean change: {delta:.4f}')
+    current = out
+
+stacked_out = current
+print(f'\nFinal output after all {N_LAYER} blocks: {list(stacked_out.shape)}')
+
+# %% [markdown]
+# ---
+# ## Step 9 — Output Head: Logits → Probabilities
+#
+# After the transformer stack, the model needs to produce a prediction for the
+# next token at each position.
+#
+# 1. **LayerNorm** — final stabilisation of the stacked-block output.
+# 2. **Linear** (`embed_dim → vocab_size`) — project each position's vector to a
+#    score (logit) for every token in the vocabulary.
+# 3. **Softmax** — convert raw scores into a probability distribution that sums to 1.
+#
+# At inference, only the last position's distribution is used to sample the next token.
+
+# %%
+with torch.no_grad():
+    normed = model.ln_f(stacked_out)
+    logits = model.lm_head(normed)
+    probs  = torch.softmax(logits, dim=-1)
+
+print(f'After stacked blocks  : {list(stacked_out.shape)}')
+print(f'After LayerNorm       : {list(normed.shape)}')
+print(f'Logits (raw scores)   : {list(logits.shape)}  (batch, seq_len, vocab_size)')
+print(f'Probabilities         : {list(probs.shape)}   (sum to 1.0 across vocab dim)')
+
+# Show the top predicted next tokens for the last position in the first sequence
+last_probs = probs[0, -1]   # (vocab_size,)
+top_k = torch.topk(last_probs, 10)
+print(f'\nTop 10 predicted next tokens after "{sample_text}":\n')
+for prob, idx in zip(top_k.values.tolist(), top_k.indices.tolist()):
+    piece = sp.id_to_piece(idx)
+    bar   = '█' * int(prob * 200)
+    print(f'  {piece:>8}  {prob:.4f}  {bar}')
+
+# %% [markdown]
+# ---
+# ## Step 10 — Inference
+#
+# Text generation is **autoregressive**: the model predicts one token at a time,
+# appends it to the context, then predicts the next one.
+#
+# ```
+# prompt tokens  →  model  →  P(next token)
+#                               │
+#                               ▼  sample
+# prompt + new token  →  model  →  P(next token)  →  ...
+# ```
+#
+# Because the model was trained on 三国演义, a Chinese-language seed will produce
+# text that resembles the style and characters of the novel.
+
+# %%
+prompts = ['刘备', '曹操大', '诸葛']
+
+for prompt in prompts:
+    context = torch.tensor(sp.encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)
+
+    with torch.no_grad():
+        generated = model.generate(context, max_new_tokens=120)
+
+    output = sp.decode(generated[0].tolist())
+    print(f'Prompt: {prompt!r}')
+    print(f'Output: {output!r}')
+    print()
