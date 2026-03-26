@@ -104,7 +104,7 @@ DROPOUT    = hp['dropout']
 HEAD_SIZE  = EMBED_DIM // N_HEAD
 
 # %%
-# Load and tokenize the text so we can sample demo batches
+# Load corpus for train/val stats used later
 with open('data/三国演义.txt', 'r') as f:
     text = f.read()
 
@@ -115,18 +115,39 @@ val_data   = data[n:]
 
 BATCH_SIZE = 64
 
-# Sample one batch — used throughout the walkthrough below
-x_ids, _ = get_batch(train_data, val_data, 'train', BLOCK_SIZE, BATCH_SIZE, DEVICE)
+# Fixed canonical passage for the walkthrough: 温酒斩华雄
+canonical_text = '''操曰：“将军出马，须要小心。”
+云长曰：“如不胜，请斩某头。”
+操教酾热酒一杯，与关公饮了上马。
+关公曰：“酒且斟下，某去便来。”
+出帐提刀，飞身上马。
+众诸侯听得关外鼓声大震，喊声大举，如天摧地塌，岳撼山崩。
+众皆失惊。
+少顷，云长提华雄之头，掷于地上。
+其酒尚温。'''
 
-sample_ids    = x_ids[0].tolist()
+full_sample_ids = sp.encode(canonical_text)
+if len(full_sample_ids) > BLOCK_SIZE:
+    sample_ids = full_sample_ids[:BLOCK_SIZE]
+    sample_text = sp.decode(sample_ids)
+    truncated = True
+else:
+    sample_ids = full_sample_ids
+    sample_text = canonical_text
+    truncated = False
 sample_pieces = [sp.id_to_piece(i) for i in sample_ids]
-sample_text   = sp.decode(sample_ids)
+seq_len = len(sample_ids)
+x_single = torch.tensor(sample_ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
+x_ids = x_single.repeat(BATCH_SIZE, 1)
 
-print('=== Sample sequence (first item in the batch) ===\n')
-print(f'Raw text     : {sample_text!r}\n')
+print('=== Canonical walkthrough passage ===\n')
+print(f'Full raw text : {canonical_text!r}\n')
+if truncated:
+    print(f'Using first {BLOCK_SIZE} tokens for model walkthrough because block_size={BLOCK_SIZE}.\n')
+print(f'Walkthrough text: {sample_text!r}\n')
 print(f'Subword pieces ({len(sample_pieces)}) : {sample_pieces}\n')
 print(f'Token IDs    : {sample_ids}\n')
-print(f'Batch shape  : {list(x_ids.shape)}  (batch_size={BATCH_SIZE}, seq_len={BLOCK_SIZE})')
+print(f'Batch shape  : {list(x_ids.shape)}  (batch_size={BATCH_SIZE}, seq_len={seq_len})')
 
 # %% [markdown]
 # ---
@@ -179,6 +200,19 @@ print(f'Output →  embeddings : {list(tok_emb.shape)}  — each ID is now a {EM
 
 
 # %%
+def nearest_tokens_from_vector(vec: torch.Tensor, embedding, sp, top_n: int = 5, exclude_ids=None):
+    """Return nearest tokens to an arbitrary vector in embedding space."""
+    all_weights = embedding.weight.detach()
+    sims = F.cosine_similarity(vec.unsqueeze(0), all_weights)
+    exclude_ids = set(exclude_ids or [])
+    for i in exclude_ids:
+        if 0 <= i < len(sims):
+            sims[i] = float('nan')
+    valid = [(i, sims[i].item()) for i in range(len(sims)) if not sims[i].isnan()]
+    valid.sort(key=lambda x: x[1], reverse=True)
+    return [(sp.id_to_piece(i), f'{s:.2f}') for i, s in valid[:top_n]]
+
+
 def show_similar_tokens(token: str, sp, embedding, top_n: int = 5):
     """Print the top_n most and least similar tokens to `token` by cosine similarity."""
     token_id = sp.piece_to_id(token)
@@ -291,6 +325,35 @@ print(f'\nQ weight shape: {list(head.q.weight.shape)}  (head_size × embed_dim)'
 print(f'K weight shape: {list(head.k.weight.shape)}')
 print(f'V weight shape: {list(head.v.weight.shape)}')
 
+# Recompute attention weights explicitly so we can inspect what one token attends to.
+with torch.no_grad():
+    B, T, C = x.shape
+    q = head.q(x)
+    k = head.k(x)
+    wei = q @ k.transpose(-2, -1) / C**0.5
+    wei = wei.masked_fill(head.tril[:T, :T] == 0, float('-inf'))
+    wei = F.softmax(wei, dim=-1)
+
+preferred_probe_tokens = ['温', '酒', '华雄', '云长', '关公']
+probe_pos = None
+for target in preferred_probe_tokens:
+    if target in sample_pieces:
+        probe_pos = sample_pieces.index(target)
+        break
+if probe_pos is None:
+    probe_pos = min(12, T - 1)
+probe_token = sample_pieces[probe_pos]
+weights = wei[0, probe_pos].detach().cpu()
+valid_positions = list(range(probe_pos + 1))
+ranked = sorted(valid_positions, key=lambda i: weights[i].item(), reverse=True)[:5]
+
+print('\n=== Single-head attention focus ===\n')
+print(f"Probe token at position {probe_pos}: {probe_token!r}")
+print('Top attended previous tokens:')
+for i in ranked:
+    tok = sample_pieces[i]
+    print(f"  pos {i:>2}  token {tok!r:<12}  weight {weights[i].item():.3f}")
+
 # %% [markdown]
 # ---
 # ## Step 5 — Multi-Head Attention
@@ -312,6 +375,19 @@ print(f'Input  →  embeddings + position : {list(x.shape)}')
 print(f'Output →  multi-head attention  : {list(mha_out.shape)}  (shape preserved)')
 print(f'\n{N_HEAD} heads × head_size {HEAD_SIZE} = {N_HEAD * HEAD_SIZE}, projected back to embed_dim {EMBED_DIM}')
 print(f'\nProjection weight shape: {list(mha.proj.weight.shape)}')
+
+print('\n=== How different heads focus on different context ===\n')
+for h_idx, h in enumerate(mha.heads):
+    with torch.no_grad():
+        q = h.q(x)
+        k = h.k(x)
+        wei = q @ k.transpose(-2, -1) / x.shape[-1]**0.5
+        wei = wei.masked_fill(h.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+    weights = wei[0, probe_pos].detach().cpu()
+    ranked = sorted(valid_positions, key=lambda i: weights[i].item(), reverse=True)[:3]
+    top_desc = [(sample_pieces[i], f'{weights[i].item():.3f}') for i in ranked]
+    print(f'  head {h_idx}: {top_desc}')
 
 # %% [markdown]
 # ---
@@ -337,6 +413,15 @@ print(f'\nLayer shapes:')
 print(f'  Linear 1: {list(ffn.net[0].weight.shape)}  (4×embed_dim, embed_dim)')
 print(f'  ReLU')
 print(f'  Linear 2: {list(ffn.net[2].weight.shape)}  (embed_dim, 4×embed_dim)')
+
+pre_ffn_vec = x[0, probe_pos].detach().cpu()
+post_ffn_vec = ffn_out[0, probe_pos].detach().cpu()
+
+print('\n=== Feed-forward semantic shift ===\n')
+print(f"Probe token: {probe_token!r}")
+print('Nearest tokens before FFN :', nearest_tokens_from_vector(pre_ffn_vec, model.embedding, sp, top_n=5, exclude_ids=[sample_ids[probe_pos]]))
+print('Nearest tokens after FFN  :', nearest_tokens_from_vector(post_ffn_vec, model.embedding, sp, top_n=5, exclude_ids=[sample_ids[probe_pos]]))
+print(f"Cosine(before, after)     : {F.cosine_similarity(pre_ffn_vec.unsqueeze(0), post_ffn_vec.unsqueeze(0)).item():.3f}")
 
 # %% [markdown]
 # ---
@@ -368,6 +453,15 @@ delta = (block_out - x).abs().mean().item()
 print(f'\nMean absolute change from residual: {delta:.4f}')
 print('(small = the block made targeted adjustments rather than replacing the representation)')
 
+pre_block_vec = x[0, probe_pos].detach().cpu()
+post_block_vec = block_out[0, probe_pos].detach().cpu()
+
+print('\n=== One full block: semantic refinement ===\n')
+print(f"Probe token: {probe_token!r}")
+print('Nearest tokens before block:', nearest_tokens_from_vector(pre_block_vec, model.embedding, sp, top_n=5, exclude_ids=[sample_ids[probe_pos]]))
+print('Nearest tokens after block :', nearest_tokens_from_vector(post_block_vec, model.embedding, sp, top_n=5, exclude_ids=[sample_ids[probe_pos]]))
+print(f"Cosine(before, after)      : {F.cosine_similarity(pre_block_vec.unsqueeze(0), post_block_vec.unsqueeze(0)).item():.3f}")
+
 # %% [markdown]
 # ---
 # ## Step 8 — Stacked Transformer Blocks
@@ -395,6 +489,15 @@ for i, block in enumerate(model.blocks):
 stacked_out = current
 print(f'\nFinal output after all {N_LAYER} blocks: {list(stacked_out.shape)}')
 
+print('\n=== Layer-by-layer semantic drift ===\n')
+current = x
+for i, block in enumerate(model.blocks):
+    with torch.no_grad():
+        current = block(current)
+    vec = current[0, probe_pos].detach().cpu()
+    neighbors = nearest_tokens_from_vector(vec, model.embedding, sp, top_n=5, exclude_ids=[sample_ids[probe_pos]])
+    print(f'  after block {i}: {neighbors}')
+
 # %% [markdown]
 # ---
 # ## Step 9 — Output Head: Logits → Probabilities
@@ -420,10 +523,15 @@ print(f'After LayerNorm       : {list(normed.shape)}')
 print(f'Logits (raw scores)   : {list(logits.shape)}  (batch, seq_len, vocab_size)')
 print(f'Probabilities         : {list(probs.shape)}   (sum to 1.0 across vocab dim)')
 
-# Show the top predicted next tokens for the last position in the first sequence
-last_probs = probs[0, -1]   # (vocab_size,)
+# Show the top predicted next tokens for a meaningful prefix from the canonical scene
+prefix = '其酒尚'
+prefix_ids = torch.tensor(sp.encode(prefix), dtype=torch.long, device=DEVICE).unsqueeze(0)
+with torch.no_grad():
+    prefix_logits, _ = model(prefix_ids)
+    last_probs = torch.softmax(prefix_logits[:, -1, :], dim=-1)[0]
+
 top_k = torch.topk(last_probs, 10)
-print(f'\nTop 10 predicted next tokens after "{sample_text}":\n')
+print(f'\nTop 10 predicted next tokens after {prefix!r}:\n')
 for prob, idx in zip(top_k.values.tolist(), top_k.indices.tolist()):
     piece = sp.id_to_piece(idx)
     bar   = '█' * int(prob * 200)
@@ -447,7 +555,7 @@ for prob, idx in zip(top_k.values.tolist(), top_k.indices.tolist()):
 # text that resembles the style and characters of the novel.
 
 # %%
-prompts = ['刘备', '曹操大', '诸葛']
+prompts = ['操曰：“将军出马，须要小心。”', '关公曰：“酒且斟下，某去便来。”', '其酒尚']
 
 for prompt in prompts:
     context = torch.tensor(sp.encode(prompt), dtype=torch.long, device=DEVICE).unsqueeze(0)

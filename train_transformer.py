@@ -15,14 +15,13 @@ else:
 print(f'Using device: {DEVICE}')
 
 # ── Hyperparameters ──────────────────────────────────────────
-VOCAB_SIZE    = 20_000
 BATCH_SIZE    = 64
 BLOCK_SIZE    = 60
 EMBED_DIM     = 128
 N_HEAD        = 4
 N_LAYER       = 4
 DROPOUT       = 0.2
-MAX_ITERS     = 50_000
+MAX_ITERS     = 5_000
 EVAL_INTERVAL = 500
 EVAL_ITERS    = 200
 LR            = 3e-4
@@ -30,6 +29,8 @@ LR            = 3e-4
 # ── Load tokenizer ───────────────────────────────────────────
 sp = spm.SentencePieceProcessor()
 sp.load('tokenizer/bpe.model')
+VOCAB_SIZE = sp.vocab_size()
+print(f'Tokenizer vocab size: {VOCAB_SIZE:,}')
 
 # ── Load and tokenize data ───────────────────────────────────
 with open('data/三国演义.txt', 'r') as f:
