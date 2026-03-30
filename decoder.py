@@ -154,12 +154,176 @@ print(f'Batch shape  : {list(x_ids.shape)}  (batch_size={BATCH_SIZE}, seq_len={s
 # ## Step 1 — Tokenisation
 #
 # Before the model sees any text it must convert raw characters into integers.
-# BPE does this by learning common subword *pieces* from the training corpus:
-# frequent sequences get their own token, rare ones are broken into smaller pieces.
+# The algorithm used here is **Byte-Pair Encoding (BPE)**.
 #
-# This lets the model handle any text with a fixed, compact vocabulary — common
-# words like `刘备` may become a single token while rare names are split into
-# smaller pieces the model has seen before.
+# ### How BPE builds a vocabulary from a corpus
+#
+# **`vocab_size` is the total number of tokens in the final dictionary** —
+# every character the tokenizer knows about, plus every merged token, counted together.
+# It is the size of the lookup table that maps token → integer ID.
+#
+# Example with the letters A B C D E F G H and `vocab_size = 20`:
+# ```
+# Start : vocab = {A, B, C, D, E, F, G, H}  → 8 tokens, IDs 0-7
+#
+# Merge 1: AB is the most frequent pair → add AB to vocab
+#          vocab = {A, B, C, D, E, F, G, H, AB}  → 9 tokens
+#
+# Merge 2: CD is next → add CD
+#          vocab = {A, B, C, D, E, F, G, H, AB, CD}  → 10 tokens
+# ...
+# Merge 12: vocab reaches 20 tokens → stop
+# ```
+# The original characters are **never removed** — they stay in the vocab so that
+# any rare combination the model hasn't seen can still fall back to individual chars.
+# `vocab_size - num_unique_chars` tells you exactly how many merges will happen.
+#
+# **The algorithm:**
+# ```
+# vocab     ← all unique characters in the corpus          (fills slots 0..N-1)
+# sequences ← every line split into individual characters
+#
+# while len(vocab) < vocab_size:
+#     pairs ← count every adjacent (a, b) across all sequences
+#     best  ← the pair with the highest count across the whole corpus
+#     merge best everywhere → ab replaces every (a, b) in every sequence
+#     vocab ← vocab ∪ {ab}                                 (fills one more slot)
+# ```
+#
+# Counting pairs across the **whole corpus** means a pair that appears in many
+# different lines beats one that appears many times in a single line. That is why
+# `刘备` and `曹操` merge early — they appear throughout the entire novel.
+#
+# After training only the merge table is saved. At inference the tokenizer just
+# replays those merges on new text — no corpus needed.
+#
+# **Why this is better than fixed word splitting:**
+# - Common words → single tokens (fewer steps for the model to process)
+# - Rare or unseen words → split into known smaller pieces (no unknown tokens ever)
+# - `vocab_size` is an explicit knob: larger = fewer splits per word, smaller = more
+#
+# The cell below runs a **toy BPE simulation** on a small corpus so you can
+# watch the vocabulary grow and the sequences shrink merge by merge.
+
+# %%
+from collections import Counter
+
+def run_toy_bpe(corpus: list, vocab_size: int):
+    """Simulate BPE training on a corpus until vocab reaches vocab_size."""
+    # Initial vocab = every unique character across all lines
+    initial_chars = sorted({ch for line in corpus for ch in line})
+    vocab = set(initial_chars)
+    sequences = [tuple(line) for line in corpus]
+    n_merges = vocab_size - len(vocab)
+
+    print(f'Corpus ({len(corpus)} lines):')
+    for line in corpus:
+        print(f'  {line!r}')
+    print(f'\nInitial vocab  : {len(vocab)} unique characters')
+    print(f'Target vocab   : {vocab_size}')
+    print(f'Merges needed  : {n_merges}')
+    print(f'\n{"Merge":<5}  {"Pair":<10}  {"Freq":<6}  {"New token":<10}  Vocab size')
+    print('-' * 55)
+
+    for merge_n in range(1, n_merges + 1):
+        pairs = Counter()
+        for seq in sequences:
+            for a, b in zip(seq, seq[1:]):
+                pairs[(a, b)] += 1
+        if not pairs:
+            break
+
+        best  = max(pairs, key=pairs.__getitem__)
+        merged = best[0] + best[1]
+        vocab.add(merged)
+
+        new_sequences = []
+        for seq in sequences:
+            new_seq, i = [], 0
+            while i < len(seq):
+                if i < len(seq) - 1 and seq[i] == best[0] and seq[i+1] == best[1]:
+                    new_seq.append(merged)
+                    i += 2
+                else:
+                    new_seq.append(seq[i])
+                    i += 1
+            new_sequences.append(tuple(new_seq))
+        sequences = new_sequences
+
+        print(f'{merge_n:<5}  {best[0]}+{best[1]:<6}  {pairs[best]:<6}  {merged!r:<10}  {len(vocab)}')
+
+    print(f'\nFinal tokenisation of each line:')
+    for orig, seq in zip(corpus, sequences):
+        print(f'  {orig!r}')
+        print(f'    → {list(seq)}')
+
+
+toy_corpus = [
+    '操曰：“将军出马，须要小心。”',
+    '云长曰：“如不胜，请斩某头。”',
+    '操教酾热酒一杯，与关公饮了上马。',
+    '关公曰：“酒且斟下，某去便来。”',
+    '出帐提刀，飞身上马。',
+    '众诸侯听得关外鼓声大震，喊声大举，如天摧地塌，岳撼山崩。',
+    '众皆失惊。',
+    '少顷，云长提华雄之头，掷于地上。',
+    '其酒尚温。'
+]
+
+unique_chars = {ch for line in toy_corpus for ch in line}
+# unique chars fill slots 0..N-1 permanently; +30 adds exactly 30 merges on top.
+run_toy_bpe(toy_corpus, vocab_size=len(unique_chars) + 10)
+
+# %% [markdown]
+# ### Why do we tokenize at all?
+#
+# Neural networks are mathematical functions — they can only operate on numbers,
+# not on text. Tokenization is the bridge that converts language into a form the
+# model can compute with.
+#
+# **The chain from raw text to model input:**
+# ```
+# "刘备胜"  →  tokenize  →  [刘备, 胜]  →  look up IDs  →  [312, 89]  →  embedding  →  vectors
+# ```
+#
+# Each integer ID is then used to look up a row in the **embedding table** — a
+# learned matrix where each token has its own vector. That is what the model
+# actually sees and processes (Step 2 covers this in detail).
+#
+# **Why not feed in raw characters?**
+#
+# You could tokenize at the character level — every Chinese character gets its own ID.
+# The problem is that the sequence becomes very long, and the model has to learn
+# relationships between characters from scratch. `刘` and `备` are individually
+# meaningless; the model only learns that `刘备` refers to a person after seeing
+# the pair thousands of times.
+#
+# BPE solves this by pre-computing that `刘备` is a meaningful unit before the model
+# ever sees it. The model gets a single token with a single embedding to learn from,
+# rather than two separate tokens it has to learn to associate.
+#
+# **Why not use whole words?**
+#
+# Classical Chinese has no spaces, so "words" are ambiguous. More importantly, a
+# word-level vocabulary would have hundreds of thousands of entries — most seen
+# only a handful of times, making their embeddings unreliable. BPE finds the
+# sweet spot: common patterns get their own token, rare ones share character-level
+# pieces they have in common with frequent words.
+#
+# **What vocab_size controls in practice:**
+#
+# | vocab_size | effect |
+# |---|---|
+# | small (1 000) | almost every token is a single character — long sequences, slow training |
+# | medium (10 000) | common words merged, rare ones split into 2–3 pieces |
+# | large (64 000) | most common words and phrases are single tokens — our model's setting |
+# | very large (100 000+) | diminishing returns; rare tokens have too few training examples |
+#
+# ### What the trained tokenizer does with real text
+#
+# The model's tokenizer was trained on the full 三国演义 corpus with a vocabulary
+# of 64,000 pieces, so its merge table is much richer. Common names and phrases
+# from the novel collapse into single tokens; unusual combinations are split.
 
 # %%
 examples = [
