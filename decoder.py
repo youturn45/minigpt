@@ -411,53 +411,67 @@ for t in probe_tokens:
 # ## Step 3 — Positional Encoding
 #
 # The transformer processes all tokens **simultaneously** — it has no built-in
-# sense of order. Without position information these two sentences look identical:
+# sense of order. Without position information, swapping the words produces
+# the exact same internal representation:
 #
 # ```
-# 刘备 打 曹操   →  bag of 3 tokens
-# 曹操 打 刘备   →  same 3 tokens, completely different meaning
+# 关羽斩华雄   →  [关羽, 斩, 华雄]  — three vectors, no order
+# 华雄斩关羽   →  [华雄, 斩, 关羽]  — same three vectors, shuffled
 # ```
 #
-# The fix: **add a fixed sine/cosine pattern to each embedding based on its
-# position**. Token at position 0 gets one pattern, position 1 a slightly
-# different one, and so on. The embedding still carries *what* the token is;
-# the pattern carries *where* it sits in the sequence.
-#
-# Positional encoding is **never updated by training** — it is computed once
-# from a formula and stays fixed.
+# The fix: **add a unique position signal to each token's vector** before
+# it enters the transformer. The token still carries *what* it means;
+# the position signal carries *where* it sits in the sentence.
 
 # %%
 with torch.no_grad():
     x = model.position_encoding(tok_emb)   # adds position signal in-place
 
-pe_matrix = model.position_encoding.pe.squeeze(0)   # (block_size, embed_dim)
-print('Positional encoding vectors — first 3 positions, first 8 dimensions:\n')
-for pos in range(3):
-    vec = pe_matrix[pos, :8].tolist()
-    print(f'  position {pos}: [{', '.join(f'{v:.3f}' for v in vec)}, ...]')
-
-print(f'\nInput  →  embeddings           : {list(tok_emb.shape)}')
-print(f'Output →  embeddings + position : {list(x.shape)}  (shape unchanged)')
-
-
 # %%
-def show_position_similarity(pe_module, anchor: int, positions: list):
-    """Show cosine similarity between an anchor position and a list of others."""
-    pe = pe_module.pe.squeeze(0)   # (block_size, embed_dim)
-    anchor_vec = pe[anchor].unsqueeze(0)
-    print(f'Cosine similarity to position {anchor}:\n')
-    for p in positions:
-        sim = F.cosine_similarity(anchor_vec, pe[p].unsqueeze(0)).item()
-        bar = '█' * int(abs(sim) * 20)
-        print(f'  vs position {p:>2}: {sim:+.3f}  {bar}')
+# Demonstrate: same token at different positions → different vector
+sent_a = '关羽斩华雄'
+sent_b = '华雄斩关羽'
 
+ids_a = sp.encode(sent_a)
+ids_b = sp.encode(sent_b)
+pieces_a = [sp.id_to_piece(i) for i in ids_a]
+pieces_b = [sp.id_to_piece(i) for i in ids_b]
 
-print('Nearby positions share a similar pattern; distant positions differ.\n')
-show_position_similarity(model.position_encoding, anchor=0,
-                         positions=[1, 2, 5, 10, 20, 40, 59])
+print(f'A: "{sent_a}"  →  {pieces_a}')
+print(f'B: "{sent_b}"  →  {pieces_b}')
 print()
-show_position_similarity(model.position_encoding, anchor=30,
-                         positions=[29, 28, 25, 20, 10, 1, 0])
+
+t_a = torch.tensor(ids_a, dtype=torch.long, device=DEVICE).unsqueeze(0)
+t_b = torch.tensor(ids_b, dtype=torch.long, device=DEVICE).unsqueeze(0)
+
+with torch.no_grad():
+    emb_a = model.embedding(t_a)
+    emb_b = model.embedding(t_b)
+    x_a   = model.position_encoding(emb_a)
+    x_b   = model.position_encoding(emb_b)
+
+# Find a token that appears in both sentences at genuinely different positions
+target_piece = pos_a = pos_b = None
+for i, tid in enumerate(ids_a):
+    if tid in ids_b:
+        j = ids_b.index(tid)
+        if i != j:          # must be at a different position to show PE effect
+            target_piece = sp.id_to_piece(tid)
+            pos_a, pos_b  = i, j
+            break
+
+if target_piece is None:
+    print('Could not find a shared token at different positions — try different example sentences.')
+else:
+    dist_before = (emb_a[0, pos_a] - emb_b[0, pos_b]).norm().item()
+    dist_after  = (x_a[0, pos_a]  - x_b[0, pos_b]).norm().item()
+
+    print(f'Shared token "{target_piece}" appears at different positions in each sentence:\n')
+    print(f'  In A "{sent_a}": position {pos_a}  ({"subject — doing the slaying" if pos_a == 0 else "object — being slain"})')
+    print(f'  In B "{sent_b}": position {pos_b}  ({"subject — doing the slaying" if pos_b == 0 else "object — being slain"})')
+    print()
+    print(f'  Vector distance BEFORE positional encoding: {dist_before:.4f}  ← identical, the model cannot tell them apart')
+    print(f'  Vector distance AFTER  positional encoding: {dist_after:.4f}  ← now distinct, position is encoded in the vector')
 
 # %% [markdown]
 # ---
@@ -498,25 +512,39 @@ with torch.no_grad():
     wei = wei.masked_fill(head.tril[:T, :T] == 0, float('-inf'))
     wei = F.softmax(wei, dim=-1)
 
-preferred_probe_tokens = ['温', '酒', '华雄', '云长', '关公']
-probe_pos = None
-for target in preferred_probe_tokens:
-    if target in sample_pieces:
-        probe_pos = sample_pieces.index(target)
-        break
-if probe_pos is None:
-    probe_pos = min(12, T - 1)
-probe_token = sample_pieces[probe_pos]
-weights = wei[0, probe_pos].detach().cpu()
-valid_positions = list(range(probe_pos + 1))
-ranked = sorted(valid_positions, key=lambda i: weights[i].item(), reverse=True)[:5]
+def is_word(piece: str) -> bool:
+    """Return True if the piece contains at least one Chinese character or letter."""
+    return any('\u4e00' <= ch <= '\u9fff' or ch.isalpha() for ch in piece)
 
-print('\n=== Single-head attention focus ===\n')
-print(f"Probe token at position {probe_pos}: {probe_token!r}")
-print('Top attended previous tokens:')
-for i in ranked:
-    tok = sample_pieces[i]
-    print(f"  pos {i:>2}  token {tok!r:<12}  weight {weights[i].item():.3f}")
+def show_head_attention(block_idx, head_idx):
+    h = model.blocks[block_idx].sa.heads[head_idx]
+    with torch.no_grad():
+        q = h.q(x)
+        k = h.k(x)
+        w = q @ k.transpose(-2, -1) / x.shape[-1]**0.5
+        w = w.masked_fill(h.tril[:T, :T] == 0, float('-inf'))
+        w = F.softmax(w, dim=-1)
+    print(f'Block {block_idx}, Head {head_idx}')
+    print(f'{"Token":<12}  attends to')
+    print('-' * 55)
+    for pos in range(T):
+        token = sample_pieces[pos]
+        if not is_word(token):
+            continue
+        weights = w[0, pos].detach().cpu()
+        ranked = sorted(range(pos + 1), key=lambda i: weights[i].item(), reverse=True)
+        top_words = [sample_pieces[i] for i in ranked if is_word(sample_pieces[i])][:5]
+        print(f'{token:<12}  →  {",  ".join(top_words)}')
+    print()
+
+print(f'Passage: {sample_text}\n')
+for block_idx, head_idx in [(0, 0), (0, 1), (1, 0), (1, 1), (N_LAYER - 1, 0), (N_LAYER - 1, N_HEAD - 1)]:
+    show_head_attention(block_idx, head_idx)
+
+# keep probe_pos pointing at a meaningful token for later steps that reference it
+preferred_probe_tokens = ['温', '酒', '华雄', '云长', '关公']
+probe_pos = next((sample_pieces.index(t) for t in preferred_probe_tokens if t in sample_pieces), min(12, T - 1))
+probe_token = sample_pieces[probe_pos]
 
 # %% [markdown]
 # ---
